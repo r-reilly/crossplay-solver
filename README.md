@@ -1,174 +1,217 @@
-# Crossplay Board Solver 🎮
+# Crossplay Solver
 
-A Python tool that analyzes a photo of your **NYT Crossplay** game board and suggests the **top 5 highest-scoring moves** you can make.
+A local web-based move solver for [NYT Crossplay](https://www.nytimes.com/games/crossplay).
+
+Enter your board manually, type your rack, and get the top 5 scored plays in under a second — complete with word definitions. No accounts, no ads, no data sent anywhere except the dictionary lookup.
 
 ---
 
-## What It Does
+## Features
 
-1. **Takes a screenshot/photo** of your Crossplay board
-2. **Uses Claude Vision API** to read all the tiles on the board (no manual entry!)
-3. **Calculates every valid word** you can form with your rack
-4. **Scores each move** using Crossplay's unique tile values and bonus squares
-5. **Returns the top 5 plays** ranked by points
+- **Interactive 15×15 board** — click a cell, type a letter, arrow-key to navigate
+- **Auto-save** — board and rack persist in `localStorage`; they reload automatically when you reopen the page or restart the server, so you never re-enter a position
+- **Carousel result cards** — use ← → arrows to browse the top 5 moves; each card shows the word, position, score, and a fetched definition
+- **Word definitions** — fetched automatically from the [Free Dictionary API](https://dictionaryapi.dev/); falls back to the singular form for plurals (e.g. QAIDS → QAID)
+- **DAWG disk cache** — the compiled word graph is saved after the first run; subsequent starts load in ~50 ms instead of ~800 ms
+- **Dark mode** — respects `prefers-color-scheme`
+- **Zero dependencies** — Python standard library only; no npm, no build step
+
+---
+
+## Project layout
+
+```
+crossplay_solver.py   # Thin entry point (16 lines) — delegates to server.py
+engine.py             # Pure solver: DAWG, Board, scoring, find_top_moves()
+service.py            # SolverService: word-list loading, DAWG caching, solve()
+server.py             # HTTP handler + inline HTML/CSS/JS UI
+test_engine.py        # 67 unit tests — no word-list file required
+collins.txt           # Word list (see Setup)
+```
+
+### Dependency graph
+
+```
+crossplay_solver.py
+        │
+        ▼
+    server.py  ──imports──▶  service.py  ──imports──▶  engine.py
+```
+
+Each layer knows only about the layer to its right:
+- `engine.py` — no I/O, no HTTP, no side-effects. Import and test without starting anything.
+- `service.py` — owns file loading and caching; calls only engine functions.
+- `server.py` — owns HTTP; calls only `SolverService.solve()`.
+- `crossplay_solver.py` — one function call; exists so users type `python crossplay_solver.py`.
+
+---
+
+## Algorithm
+
+Implements **Appel & Jacobsen (1988), "The World's Fastest Scrabble Program"**:
+
+1. **DAWG** — The word list is compiled into a Directed Acyclic Word Graph. Structurally identical suffix sub-graphs are merged so the full dictionary fits in memory and every prefix lookup is O(word length).
+
+2. **Cross-check sets** — Before generating any move, the engine precomputes which letters may legally be placed at each empty square without creating an illegal perpendicular word. Invalid placements are ruled out *during* generation — there is no post-filtering step.
+
+3. **Anchor-based generation** — For each empty square adjacent to a placed tile (an *anchor*), the engine walks left through the DAWG building prefixes, then extends right — gated at every step by the cross-check sets.
+
+Scoring follows Crossplay rules: Crossplay-specific tile values, verified bonus-square positions, and a **40-point bingo bonus** for using all 7 rack tiles.
 
 ---
 
 ## Setup
 
-### 1. Install dependencies
+**1. Python 3.10 or later** (no third-party packages needed)
 
 ```bash
-pip install anthropic
+python --version   # must be 3.10+
 ```
 
-### 2. Set your Anthropic API key
+**2. Word list — Collins Scrabble Words**
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-your-key-here
+Crossplay's dictionary most closely matches **Collins Scrabble Words** (also distributed as `sowpods.txt`). Download your Collins word list, name it `collins.txt`, and place it in the same directory as the solver files.
+
+The engine searches for a word list in this order:
+
+```
+collins.txt  →  sowpods.txt  →  TWL06.txt  →  twl06.txt  →  enable1.txt
 ```
 
-Get a key at: https://console.anthropic.com/
-
-### 3. (Recommended) Add a word list
-
-Download a large word list for maximum accuracy:
-
-```bash
-# Option A — enable1 word list (~172k words, good NWL coverage)
-curl -O https://raw.githubusercontent.com/dolph/dictionary/master/enable1.txt
-
-# Option B — SOWPODS (~267k words)
-# Search for "sowpods.txt" and place in the same folder
-
-# Option C — system dictionary (auto-detected on Linux/macOS)
-# /usr/share/dict/words is used automatically if found
-```
-
-Place any word file named `words.txt`, `enable1.txt`, `twl06.txt`, or `sowpods.txt`
-in the same directory as `crossplay_solver.py`.
-
-Without a word file, the tool uses a built-in fallback set (~400 common words).
+> **Why Collins and not TWL06 or enable1.txt?**
+> TWL06 (North American tournament list) omits words that Crossplay accepts — EW, ELD, WOS among others. `enable1.txt` has even larger gaps. Collins is the closest freely available match to the Crossplay dictionary and correctly validates cross-words like ELD and WOS that determine whether high-value plays (e.g. QAIDS at A15 for 130 pts) are legal.
 
 ---
 
-## Usage
-
-### Basic — image + rack tiles
+## Running
 
 ```bash
-python crossplay_solver.py board.png KVANEST
+python crossplay_solver.py
 ```
 
-### If your rack is visible in the screenshot
+Opens `http://localhost:8080` automatically. On the **first run** the DAWG is built (~0.8 s) and cached to `.dawg_cache_<N>.pkl`; subsequent starts load from cache (~0.05 s).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port PORT` | `8080` | TCP port |
+| `--no-browser` | off | Skip auto-opening browser |
 
 ```bash
-# Claude will auto-detect rack tiles from the image
-python crossplay_solver.py board.png
-```
-
-### With spaces in rack letters
-
-```bash
-python crossplay_solver.py board.jpg "K V A N E S T"
-```
-
-### Show top 10 moves instead of 5
-
-```bash
-python crossplay_solver.py board.png KVANEST --top 10
-```
-
-### Skip Claude vision (empty board / first move only)
-
-```bash
-python crossplay_solver.py dummy.png KVANEST --no-vision
+python crossplay_solver.py --port 9090 --no-browser
 ```
 
 ---
 
-## Example Output
+## Using the UI
 
+1. **Click any cell** on the board and type a letter — the cursor advances right automatically.
+2. **Arrow keys** navigate, **Backspace** clears a cell.
+3. Type your **rack** (use `?` for a blank tile) and click **Find best moves**.
+4. The top 5 moves appear as horizontal cards in a carousel. Use **← →** arrows to browse. Click any card to highlight that placement on the board.
+5. **Clear board** resets everything including the saved state.
+
+**Board state is saved automatically.** Every cell and rack change is written to `localStorage` immediately. If you close the tab, restart the server, or refresh the page, the board and rack reload exactly as you left them — a brief green flash on the board confirms the restore.
+
+---
+
+## Running the tests
+
+```bash
+python -m unittest test_engine -v   # no word-list file needed
 ```
-📷 Analyzing board image: board.png
-   (Sending to Claude Vision API...)
-✓ Board parsed: 23 tiles on board
-✓ Rack detected from image: K V A N E S T
 
-🔎 Searching for best moves with rack: K V A N E S T
-   Word list size: 172,820 words
+Or with pytest:
 
-============================================================
-  🎮  CROSSPLAY MOVE ANALYZER — TOP 5 PLAYS
-============================================================
-  Your rack: K V A N E S T
-------------------------------------------------------------
-  #1  THANKS          D8 →   Score:   38 pts ⭐ Great play
-  #2  SKATE           H4 ↓   Score:   32 pts
-  #3  TANK            F7 →   Score:   28 pts
-  #4  VANES           J5 →   Score:   26 pts
-  #5  STAKE           C11 ↓  Score:   24 pts
-============================================================
+```bash
+pytest test_engine.py -v
+```
+
+**67 tests** cover:
+
+| Class | What is tested |
+|-------|---------------|
+| `TestDawgNode` | Node equality and structural hashing |
+| `TestDawg` | Insert, membership, prefix traversal, minimisation |
+| `TestBoard` | Placement, bounds, neighbours, word extraction |
+| `TestSquareMultipliers` | Every bonus type; disjoint-set invariant |
+| `TestCrossChecks` | Occupied, unconstrained, and constrained squares |
+| `TestAnchorSquares` | Empty board, first-move rule, adjacency |
+| `TestScoring` | Face value, blanks, multipliers, bingo bonus |
+| `TestFindTopMoves` | Type, sort order, deduplication, bounds, cross-word validity, blanks |
+| `TestServiceHelpers` | `_board_from_grid`, `_parse_rack` |
+| `TestSolverService` | `solve()` keys, empty rack, valid/invalid notes, `invalid_words()`, server injection |
+| `TestWordListError` | `WordListError` raised instead of `sys.exit` |
+
+Tests use an injected 50-word set — no word file required — and run in under 300 ms.
+
+---
+
+## Using the engine directly
+
+```python
+from engine import Board, build_dawg, find_top_moves, load_word_list
+
+words, dawg = load_word_list()   # raises WordListError if no file found
+
+board = Board()
+board.place(7, 7, "W"); board.place(7, 8, "A"); board.place(7, 9, "I")
+board.place(7,10, "V"); board.place(7,11, "E"); board.place(7,12, "D")
+
+moves = find_top_moves(board, ["O","Y","I","L","L","G","?"], dawg, top_n=5)
+for m in moves:
+    col = "ABCDEFGHIJKLMNO"[m.col]
+    print(f"{m.word:15} {col}{m.row+1} {'→' if m.horizontal else '↓'}  {m.score} pts")
+```
+
+## Using SolverService
+
+```python
+from service import SolverService
+
+# Production: auto-find word list, use DAWG disk cache
+service = SolverService.from_word_list()
+
+# Explicit path, no cache
+service = SolverService.from_word_list("TWL06.txt", use_cache=False)
+
+# In tests: inject a tiny word set, no filesystem access
+from engine import build_dawg
+service = SolverService(words={"GO","OIL"}, dawg=build_dawg({"GO","OIL"}))
+
+result = service.solve(grid_data=[[...]], rack_str="OYILLG?")
+# result = {"board":..., "rack":..., "moves":[...], "notes":"", "tiles_on_board":N}
 ```
 
 ---
 
-## Crossplay Tile Values
+## Crossplay vs Scrabble
 
-| Letters | Points |
-|---------|--------|
-| A, E, I, L, N, O, R, S, T, U | 1 pt |
-| D, G | 2 pts |
-| B, C, F, H, M, P, Y | 3–4 pts |
-| K, V | 5–6 pts |
-| W | 5 pts |
-| J, X | 8 pts |
-| Q, Z | 10 pts |
-| Blank (?) | 0 pts |
+| Difference | Scrabble | Crossplay |
+|------------|----------|-----------|
+| Bingo bonus | 50 pts | 40 pts |
+| Tile values | Standard | Different (e.g. H=3, V=6, W=5) |
+| Bonus layout | Standard symmetric pattern | Different positions |
 
-**Bingo Bonus:** Play all 7 tiles = +40 points!
+Both tile values and bonus positions are hardcoded as `frozenset` constants in `engine.py` and verified against the official blank Crossplay board.
 
 ---
 
-## Board Multipliers
+## Architecture notes
 
-| Square | Effect |
-|--------|--------|
-| 2L | Double letter score |
-| 3L | Triple letter score |
-| 2W | Double word score |
-| 3W | Triple word score |
+### Why `SolverService` instead of direct engine calls?
 
----
+Previously `server.py` called `find_top_moves` and `load_word_list` directly. This made three things hard:
 
-## Tips for Best Results
+1. **Testing** — you had to touch the filesystem to swap in a small word set.
+2. **Caching** — the DAWG rebuild on every restart was impossible to optimise without leaking disk logic into the server.
+3. **Replaceability** — swapping the engine (e.g. for a Rust extension) required changing `server.py`.
 
-- **Take a clear, straight-on photo** of the board (avoid angles)
-- **Good lighting** helps Claude read the tiles accurately
-- **Include your rack** in the screenshot if possible (bottom of screen)
-- **Use a large word list** file for the best move suggestions
-- If a suggested move is rejected by the app, try the next one — Crossplay's word list is curated
+`SolverService` solves all three: inject it in tests, hide caching inside it, replace just it when swapping engines.
 
----
+### Why `WordListError` instead of `sys.exit`?
 
-## Architecture
+`sys.exit` in a library function makes code untestable without process-level tricks. `WordListError` (a `FileNotFoundError` subclass) lets the server log a clean message, lets tests assert on it directly, and lets future callers handle it however they want.
 
-```
-board photo
-    │
-    ▼
-Claude Vision API  ──►  15×15 grid JSON
-    │
-    ▼
-Board Parser  ──►  Board object
-    │
-    ├── Word List (NWL23-compatible)
-    │
-    ▼
-Anchor-based Move Finder
-    │   • Tries all words × all positions × both directions
-    │   • Scores: tile values + letter/word multipliers + cross-words + bingo bonus
-    │
-    ▼
-Top 5 Moves (sorted by score)
-```
+### Why is the HTML inlined in `server.py`?
+
+The tool runs with a single `python crossplay_solver.py` command and zero build steps. Keeping the UI in the same file makes distribution trivial — one directory, four `.py` files, one word list. The HTML is at the *bottom* of the file so the Python logic is always visible first.
